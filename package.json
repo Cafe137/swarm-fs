@@ -1,0 +1,23 @@
+{
+    "name": "swarm-fs",
+    "version": "0.1.0",
+    "type": "module",
+    "files": [
+        "dist",
+        "README.md",
+        ".env.example"
+    ],
+    "bin": {
+        "swarm-fs": "dist/index.js"
+    },
+    "scripts": {
+        "build": "tsc"
+    },
+    "dependencies": {
+        "cafe-utility": "^35.0.0"
+    },
+    "devDependencies": {
+        "@types/node": "^26.0.1",
+        "typescript": "^6.0.3"
+    }
+}
