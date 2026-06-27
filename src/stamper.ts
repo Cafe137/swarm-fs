@@ -16,13 +16,13 @@ const SIGNATURE_PREFIX = new Uint8Array([
  * @param slot Slot number for the chunk
  * @returns A hex string representing the stamped data, which can be used in the "swarm-postage-stamp" header
  */
-export function stamp(signer: bigint, batchId: Uint8Array, chunk: Chunk, slot: number) {
+export function stamp(signer: bigint, batchId: Uint8Array, chunk: Chunk, slot: number, nowMs = Date.now()) {
     const address = chunk.hash()
 
     const bucket = Binary.uint16ToNumber(address, 'BE')
     const index = Binary.concatBytes(Binary.numberToUint32(bucket, 'BE'), Binary.numberToUint32(slot, 'BE'))
 
-    const currentTimeNs = BigInt(Date.now()) * 1_000_000n
+    const currentTimeNs = BigInt(nowMs) * 1_000_000n
     const timestamp = Binary.numberToUint64(currentTimeNs, 'BE')
 
     const data = Binary.concatBytes(address, batchId, index, timestamp)

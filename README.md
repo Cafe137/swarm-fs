@@ -2,6 +2,12 @@
 
 Swarm FS is an upload layer on top of Bee that stamps chunks client-side and tracks which slots in a postage batch are occupied by each file. This makes it possible to "delete" a file by reclaiming its slots for future uploads — something Swarm has no native concept of.
 
+## Installation
+
+```sh
+npm install --global swarm-fs
+```
+
 ## Usage
 
 Environment variables can be set in your shell profile for global use, or in a local `.env` file if you prefer per-project configuration:
@@ -14,20 +20,20 @@ export SWARMFS_BATCH_DEPTH=<depth of your batch>
 ```
 
 ```sh
-# Upload a file and print its root hash
-swarm-fs upload <file>
+# Upload a file or directory and print the manifest root hash
+swarm-fs upload <file|dir>
 
-# List all tracked files
+# List all tracked files and manifests
 swarm-fs list
 
-# Delete a file by root hash, reclaiming its slots
+# Delete a file or manifest by root hash, reclaiming its slots
 swarm-fs delete <root hash>
 
 # Show slot usage and most utilized bucket
 swarm-fs status
 ```
 
-State is stored in `~/.swarmfs/`, with files named by the first 8 hex characters of the batch ID (e.g. `swarmfs-a1b2c3d4.free`, `swarmfs-a1b2c3d4.idx`). Multiple postage batches can be used independently by switching `SWARMFS_BATCH_ID`.
+State is stored in `~/.swarmfs/`, with files named by the first 8 hex characters of the batch ID (e.g. `swarmfs-a1b2c3d4.free`, `swarmfs-a1b2c3d4.db`). Multiple postage batches can be used independently by switching `SWARMFS_BATCH_ID`.
 
 ## Design
 
@@ -46,31 +52,41 @@ per bucket (65536 entries, indexed by bucket number):
 
 The fixed-size layout allows O(1) access by bucket index. Allocating a slot scans the bucket's bitmap for the first 0 bit and sets it to 1. Freeing a slot clears the corresponding bit. File size is determined by batch depth: for depth 24 (256 slots per bucket), the file is 2 MB.
 
-### `swarmfs.idx` — FileRegistry
+### `swarmfs.db` — FileRegistry
 
-Tracks all uploaded files, their root chunk hash, and the list of slots they occupy.
+A SQLite database tracking all uploaded files, their root chunk hash, and the slots they occupy.
 
-```
-[file count: uint32]
-
-per file:
-  [path length: uint16]
-  [path: utf8 bytes]
-  [root hash: 32 bytes]
-  [chunk count: uint32]
-  [chunk 0: bucket uint16, slot uint16]
-  [chunk 1: bucket uint16, slot uint16]
-  ...
+```sql
+CREATE TABLE files (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    path      TEXT NOT NULL,
+    root_hash BLOB NOT NULL,   -- 32 bytes
+    chunks    BLOB NOT NULL    -- repeated [bucket uint16, slot uint16] pairs
+);
+CREATE INDEX idx_root_hash ON files(root_hash);
 ```
 
-Overhead is approximately 4 bytes per chunk — about 0.1% of the file size — regardless of file size.
+Chunk refs are packed as 4 bytes each (`[bucket uint16][slot uint16]`), so overhead is approximately 4 bytes per chunk — about 0.1% of the file size — regardless of file size. The index on `root_hash` makes lookup and deletion O(log N) in the number of tracked files.
+
+### Manifest upload flow
+
+`upload <dir>` packages a directory as a Swarm website so it can be browsed via the Bzz gateway (`/bzz/<root-hash>/`).
+
+It builds a [Mantaray v0.2](https://github.com/ethersphere/bee/tree/master/pkg/manifest/mantaray) trie — the same binary format Bee uses natively:
+
+1. **Pass 1 — upload content**: walk the directory, split each file into chunks, stamp and upload each chunk, collect the root hash per file
+2. **Pass 2 — build the trie**: construct a Mantaray node for every file path (no leading slash, e.g. `index.html`), plus a `'/'` metadata node carrying `website-index-document` if `index.html` is present — this is what Bee reads to serve the index page
+3. **Upload the trie**: serialize each trie node into a chunk, stamp and upload it, record the manifest root hash in `swarmfs.db`
+
+After upload, the directory is accessible at `<gateway>/bzz/<root-hash>/` and `<gateway>/bzz/<root-hash>/path/to/file`.
 
 ### Upload flow
 
 1. Split the file into chunks client-side
 2. For each chunk, allocate a slot from `swarmfs.free` for the matching bucket
 3. Sign the stamp with the chosen `(bucket, slot)` and send the pre-signed chunk to Bee
-4. Record the root hash and all `(bucket, slot)` pairs in `swarmfs.idx`
+4. Wrap the file in a single-entry Mantaray manifest (with a `website-index-document` pointer) so the file is directly browseable at `<gateway>/bzz/<root-hash>/`
+5. Record the manifest root hash and all `(bucket, slot)` pairs in `swarmfs.idx`
 
 ### Deletion flow
 

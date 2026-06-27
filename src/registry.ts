@@ -1,96 +1,72 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
-
-const ENCODER = new TextEncoder()
-const DECODER = new TextDecoder()
+import Database from 'better-sqlite3'
 
 export interface ChunkRef {
     bucket: number
     slot: number
 }
 
-interface FileEntry {
-    path: string
-    rootHash: Uint8Array
-    chunks: ChunkRef[]
-}
+export type EntryKind = 'file' | 'manifest'
 
 export class FileRegistry {
-    private entries: FileEntry[]
+    private db: Database.Database
 
-    constructor(private path: string) {
-        this.entries = existsSync(path) ? this.parse(readFileSync(path)) : []
+    constructor(path: string) {
+        this.db = new Database(path)
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS files (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                path      TEXT NOT NULL,
+                root_hash BLOB NOT NULL,
+                chunks    BLOB NOT NULL,
+                kind      TEXT NOT NULL DEFAULT 'file'
+            );
+            CREATE INDEX IF NOT EXISTS idx_root_hash ON files(root_hash);
+        `)
+        // migrate databases created before the kind column was added
+        const cols = this.db.prepare('PRAGMA table_info(files)').all() as Array<{ name: string }>
+        if (!cols.some(c => c.name === 'kind')) {
+            this.db.exec("ALTER TABLE files ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'")
+        }
     }
 
-    list(): Array<{ path: string; rootHash: Uint8Array }> {
-        return this.entries.map(({ path, rootHash }) => ({ path, rootHash }))
+    list(): Array<{ path: string; rootHash: Uint8Array; kind: EntryKind }> {
+        const rows = this.db.prepare('SELECT path, root_hash, kind FROM files').all() as Array<{
+            path: string
+            root_hash: Buffer
+            kind: EntryKind
+        }>
+        return rows.map(row => ({ path: row.path, rootHash: row.root_hash, kind: row.kind }))
     }
 
-    add(path: string, rootHash: Uint8Array, chunks: ChunkRef[]): void {
-        this.entries.push({ path, rootHash, chunks })
-        this.save()
+    add(path: string, rootHash: Uint8Array, chunks: ChunkRef[], kind: EntryKind = 'file'): void {
+        this.db
+            .prepare('INSERT INTO files (path, root_hash, chunks, kind) VALUES (?, ?, ?, ?)')
+            .run(path, rootHash, serializeChunks(chunks), kind)
     }
 
     removeByRootHash(rootHash: Uint8Array): ChunkRef[] | null {
-        const hex = Buffer.from(rootHash).toString('hex')
-        const i = this.entries.findIndex(e => Buffer.from(e.rootHash).toString('hex') === hex)
-        if (i === -1) return null
-        const [entry] = this.entries.splice(i, 1)
-        this.save()
-        return entry.chunks
+        const row = this.db.prepare('SELECT id, chunks FROM files WHERE root_hash = ? LIMIT 1').get(rootHash) as
+            | { id: number; chunks: Buffer }
+            | undefined
+        if (!row) return null
+        this.db.prepare('DELETE FROM files WHERE id = ?').run(row.id)
+        return deserializeChunks(row.chunks)
     }
+}
 
-    private parse(buf: Buffer): FileEntry[] {
-        const entries: FileEntry[] = []
-        let offset = 0
-        const fileCount = buf.readUInt32BE(offset)
-        offset += 4
-        for (let f = 0; f < fileCount; f++) {
-            const pathLen = buf.readUInt16BE(offset)
-            offset += 2
-            const path = DECODER.decode(buf.subarray(offset, offset + pathLen))
-            offset += pathLen
-            const rootHash = buf.subarray(offset, offset + 32)
-            offset += 32
-            const chunkCount = buf.readUInt32BE(offset)
-            offset += 4
-            const chunks: ChunkRef[] = []
-            for (let c = 0; c < chunkCount; c++) {
-                const bucket = buf.readUInt16BE(offset)
-                offset += 2
-                const slot = buf.readUInt16BE(offset)
-                offset += 2
-                chunks.push({ bucket, slot })
-            }
-            entries.push({ path, rootHash, chunks })
-        }
-        return entries
+function serializeChunks(chunks: ChunkRef[]): Buffer {
+    const buf = Buffer.alloc(chunks.length * 4)
+    for (let i = 0; i < chunks.length; i++) {
+        buf.writeUInt16BE(chunks[i].bucket, i * 4)
+        buf.writeUInt16BE(chunks[i].slot, i * 4 + 2)
     }
+    return buf
+}
 
-    private serialize(): Buffer {
-        const parts: Buffer[] = []
-        const fileCountBuf = Buffer.alloc(4)
-        fileCountBuf.writeUInt32BE(this.entries.length)
-        parts.push(fileCountBuf)
-        for (const entry of this.entries) {
-            const pathBytes = Buffer.from(ENCODER.encode(entry.path))
-            const pathLenBuf = Buffer.alloc(2)
-            pathLenBuf.writeUInt16BE(pathBytes.length)
-            parts.push(pathLenBuf, pathBytes)
-            parts.push(Buffer.from(entry.rootHash))
-            const chunkCountBuf = Buffer.alloc(4)
-            chunkCountBuf.writeUInt32BE(entry.chunks.length)
-            parts.push(chunkCountBuf)
-            for (const { bucket, slot } of entry.chunks) {
-                const chunkBuf = Buffer.alloc(4)
-                chunkBuf.writeUInt16BE(bucket)
-                chunkBuf.writeUInt16BE(slot, 2)
-                parts.push(chunkBuf)
-            }
-        }
-        return Buffer.concat(parts)
+function deserializeChunks(buf: Buffer): ChunkRef[] {
+    const chunks: ChunkRef[] = []
+    for (let i = 0; i < buf.length; i += 4) {
+        chunks.push({ bucket: buf.readUInt16BE(i), slot: buf.readUInt16BE(i + 2) })
     }
-
-    private save(): void {
-        writeFileSync(this.path, this.serialize())
-    }
+    return chunks
 }

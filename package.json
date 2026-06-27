@@ -1,6 +1,6 @@
 {
     "name": "swarm-fs",
-    "version": "0.1.0",
+    "version": "1.0.0",
     "type": "module",
     "files": [
         "dist",
@@ -14,9 +14,11 @@
         "build": "tsc"
     },
     "dependencies": {
+        "better-sqlite3": "^12.11.1",
         "cafe-utility": "^35.0.0"
     },
     "devDependencies": {
+        "@types/better-sqlite3": "^7.6.13",
         "@types/node": "^26.0.1",
         "typescript": "^6.0.3"
     }
