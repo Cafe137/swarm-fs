@@ -23,6 +23,9 @@ export SWARMFS_BATCH_DEPTH=<depth of your batch>
 # Upload a file or directory and print the manifest root hash
 swarm-fs upload <file|dir>
 
+# Upload with client-side encryption
+swarm-fs upload <file|dir> --encrypt
+
 # List all tracked files and manifests
 swarm-fs list
 
@@ -31,6 +34,13 @@ swarm-fs delete <root hash>
 
 # Show slot usage and most utilized bucket
 swarm-fs status
+
+# Benchmark chunk splitting speed (no upload, no state changes)
+swarm-fs bench:split <file|dir>
+
+# Benchmark chunk splitting + stamp signing speed (no upload, no state changes)
+# Requires SWARMFS_SIGNER, SWARMFS_BATCH_ID, and SWARMFS_BATCH_DEPTH
+swarm-fs bench:sign <file|dir>
 ```
 
 State is stored in `~/.swarmfs/`, with files named by the first 8 hex characters of the batch ID (e.g. `swarmfs-a1b2c3d4.free`, `swarmfs-a1b2c3d4.db`). Multiple postage batches can be used independently by switching `SWARMFS_BATCH_ID`.
@@ -61,7 +71,8 @@ CREATE TABLE files (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     path      TEXT NOT NULL,
     root_hash BLOB NOT NULL,   -- 32 bytes
-    chunks    BLOB NOT NULL    -- repeated [bucket uint16, slot uint16] pairs
+    chunks    BLOB NOT NULL,   -- repeated [bucket uint16, slot uint16] pairs
+    kind      TEXT NOT NULL DEFAULT 'file'  -- 'file' or 'manifest'
 );
 CREATE INDEX idx_root_hash ON files(root_hash);
 ```
@@ -86,11 +97,11 @@ After upload, the directory is accessible at `<gateway>/bzz/<root-hash>/` and `<
 2. For each chunk, allocate a slot from `swarmfs.free` for the matching bucket
 3. Sign the stamp with the chosen `(bucket, slot)` and send the pre-signed chunk to Bee
 4. Wrap the file in a single-entry Mantaray manifest (with a `website-index-document` pointer) so the file is directly browseable at `<gateway>/bzz/<root-hash>/`
-5. Record the manifest root hash and all `(bucket, slot)` pairs in `swarmfs.idx`
+5. Record the manifest root hash and all `(bucket, slot)` pairs in `swarmfs.db`
 
 ### Deletion flow
 
-1. Look up the file's chunk list in `swarmfs.idx`
+1. Look up the file's chunk list in `swarmfs.db`
 2. Return all its `(bucket, slot)` pairs to `swarmfs.free` under their respective buckets
-3. Remove the file entry from `swarmfs.idx`
+3. Remove the file entry from `swarmfs.db`
 4. Optionally upload tombstone chunks to overwrite the slots on the network

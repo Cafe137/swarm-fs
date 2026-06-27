@@ -1,4 +1,5 @@
 import { Binary, Chunk, ChunkSplitter, Uint8ArrayReader } from 'cafe-utility'
+import { randomBytes } from 'node:crypto'
 
 const ENCODER = new TextEncoder()
 const DECODER = new TextDecoder()
@@ -48,7 +49,7 @@ export class Fork {
             return b
         }
 
-        const node = new MantarayNode({ path: commonPart })
+        const node = new MantarayNode({ path: commonPart, encrypt: a.node.encrypt })
 
         const newAFork = new Fork(a.prefix.slice(commonPart.length), a.node)
         const newBFork = new Fork(b.prefix.slice(commonPart.length), b.node)
@@ -122,6 +123,7 @@ interface MantarayNodeOptions {
     metadata?: Record<string, string> | null
     path?: Uint8Array | null
     parent?: MantarayNode | null
+    encrypt?: boolean
 }
 
 export class MantarayNode {
@@ -132,10 +134,17 @@ export class MantarayNode {
     public path: Uint8Array = new Uint8Array(0)
     public forks: Map<number, Fork> = new Map()
     public parent: MantarayNode | null = null
+    public encrypt: boolean = false
 
     constructor(options?: MantarayNodeOptions) {
+        if (options?.encrypt) {
+            this.encrypt = true
+        }
+
         if (options?.targetAddress) {
             this.targetAddress = options.targetAddress
+        } else if (this.encrypt) {
+            this.targetAddress = new Uint8Array(64)
         }
 
         if (options?.selfAddress) {
@@ -175,6 +184,9 @@ export class MantarayNode {
             if (!fork.node.selfAddress) {
                 fork.node.selfAddress = await fork.node.calculateSelfAddress()
             }
+        }
+        if (this.encrypt && Binary.equals(this.obfuscationKey, new Uint8Array(32))) {
+            this.obfuscationKey = new Uint8Array(randomBytes(32))
         }
         const header = new Uint8Array(32)
         header.set(VERSION_02_HASH, 0)
@@ -224,7 +236,8 @@ export class MantarayNode {
                 new MantarayNode({
                     targetAddress: isLast ? reference : undefined,
                     metadata: isLast ? metadata : undefined,
-                    path: remainingPath
+                    path: remainingPath,
+                    encrypt: this.encrypt
                 })
             )
 
@@ -252,21 +265,38 @@ export class MantarayNode {
         if (this.selfAddress) {
             return this.selfAddress
         }
-
+        if (this.encrypt) {
+            throw new Error('calculateSelfAddress is not supported for encrypted nodes — use saveRecursively')
+        }
         return (await ChunkSplitter.root(await this.marshal())).hash()
     }
 
     /**
      * Saves the node and its children recursively.
+     * For encrypted nodes, returns a 64-byte reference (address + key).
      */
-    async saveRecursively(onChunk: (chunk: Chunk) => Promise<void>): Promise<Uint8Array> {
+    async saveRecursively(onChunk: (chunk: Chunk, key?: Uint8Array) => Promise<void>): Promise<Uint8Array> {
         for (const fork of this.forks.values()) {
             await fork.node.saveRecursively(onChunk)
         }
-        const splitter = new ChunkSplitter(onChunk)
+        let nodeEncryptedRef: { address: Uint8Array; key: Uint8Array } | undefined
+        const nodeOnChunk = this.encrypt
+            ? async (chunk: Chunk, key?: Uint8Array) => {
+                  if (key) nodeEncryptedRef = chunk.encryptedHash(key)
+                  await onChunk(chunk, key)
+              }
+            : onChunk
+        const splitter = new ChunkSplitter(nodeOnChunk, this.encrypt)
         await splitter.append(await this.marshal())
         const root = await splitter.finalize()
-        this.selfAddress = root.hash()
+        if (this.encrypt) {
+            if (!nodeEncryptedRef) {
+                throw new Error('Encrypted ChunkSplitter did not provide an encryption key for manifest node')
+            }
+            this.selfAddress = Binary.concatBytes(nodeEncryptedRef.address, nodeEncryptedRef.key)
+        } else {
+            this.selfAddress = root.hash()
+        }
         return this.selfAddress
     }
 
@@ -329,7 +359,8 @@ export class MantarayNode {
     determineType() {
         let type = 0
 
-        if (!Binary.equals(this.targetAddress, NULL_ADDRESS) || Binary.equals(this.path, PATH_SEPARATOR)) {
+        const nullAddress = new Uint8Array(this.targetAddress.length)
+        if (!Binary.equals(this.targetAddress, nullAddress) || Binary.equals(this.path, PATH_SEPARATOR)) {
             type |= TYPE_VALUE
         }
 

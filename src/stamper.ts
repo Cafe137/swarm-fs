@@ -1,4 +1,4 @@
-import { Binary, Chunk, Elliptic } from 'cafe-utility'
+import { Binary, Elliptic } from 'cafe-utility'
 
 /**
  * "\x19Ethereum Signed Message:\n32"
@@ -12,13 +12,11 @@ const SIGNATURE_PREFIX = new Uint8Array([
  *
  * @param signer Private key of the signer in bigint format
  * @param batchId Postage batch ID in Uint8Array format
- * @param chunk Chunk to be stamped
+ * @param address Address of the chunk (plain hash or encrypted address)
  * @param slot Slot number for the chunk
  * @returns A hex string representing the stamped data, which can be used in the "swarm-postage-stamp" header
  */
-export function stamp(signer: bigint, batchId: Uint8Array, chunk: Chunk, slot: number, nowMs = Date.now()) {
-    const address = chunk.hash()
-
+export function stamp(signer: bigint, batchId: Uint8Array, address: Uint8Array, slot: number, nowMs = Date.now()) {
     const bucket = Binary.uint16ToNumber(address, 'BE')
     const index = Binary.concatBytes(Binary.numberToUint32(bucket, 'BE'), Binary.numberToUint32(slot, 'BE'))
 

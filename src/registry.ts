@@ -29,13 +29,21 @@ export class FileRegistry {
         }
     }
 
-    list(): Array<{ path: string; rootHash: Uint8Array; kind: EntryKind }> {
-        const rows = this.db.prepare('SELECT path, root_hash, kind FROM files').all() as Array<{
+    list(): Array<{ path: string; rootHash: Uint8Array; kind: EntryKind; chunkCount: number }> {
+        const rows = this.db
+            .prepare('SELECT path, root_hash, kind, length(chunks) AS chunks_len FROM files')
+            .all() as Array<{
             path: string
             root_hash: Buffer
             kind: EntryKind
+            chunks_len: number
         }>
-        return rows.map(row => ({ path: row.path, rootHash: row.root_hash, kind: row.kind }))
+        return rows.map(row => ({
+            path: row.path,
+            rootHash: row.root_hash,
+            kind: row.kind,
+            chunkCount: row.chunks_len / 4
+        }))
     }
 
     add(path: string, rootHash: Uint8Array, chunks: ChunkRef[], kind: EntryKind = 'file'): void {
