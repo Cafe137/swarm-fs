@@ -1,6 +1,6 @@
 {
     "name": "swarm-fs",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "type": "module",
     "files": [
         "dist",
@@ -15,7 +15,11 @@
     },
     "dependencies": {
         "better-sqlite3": "^12.11.1",
-        "cafe-utility": "^35.0.2"
+        "cafe-utility": "^36.1.8"
+    },
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/Cafe137/swarm-fs"
     },
     "devDependencies": {
         "@types/better-sqlite3": "^7.6.13",

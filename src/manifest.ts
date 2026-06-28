@@ -1,4 +1,4 @@
-import { Binary, Chunk, ChunkSplitter, Uint8ArrayReader } from 'cafe-utility'
+import { Binary, Chunk, ChunkEntry, ChunkSplitter, Uint8ArrayReader } from 'cafe-utility'
 import { randomBytes } from 'node:crypto'
 
 const ENCODER = new TextEncoder()
@@ -11,7 +11,6 @@ const TYPE_WITH_METADATA = 16
 const PATH_SEPARATOR = new Uint8Array([47])
 const VERSION_02_HASH_HEX = '5768b3b6a7db56d21d1abff40d41cebfc83448fed8d7e9b06ec0d3b073f28f7b'
 const VERSION_02_HASH = Binary.hexToUint8Array(VERSION_02_HASH_HEX)
-const NULL_ADDRESS = new Uint8Array(32)
 
 function isType(value: number, type: number): boolean {
     return (value & type) === type
@@ -273,31 +272,40 @@ export class MantarayNode {
 
     /**
      * Saves the node and its children recursively.
-     * For encrypted nodes, returns a 64-byte reference (address + key).
+     * Returns the 32-byte manifest root hash (or 64-byte encrypted ref) and
+     * the root Chunk so callers can create dispersed replicas.
      */
-    async saveRecursively(onChunk: (chunk: Chunk, key?: Uint8Array) => Promise<void>): Promise<Uint8Array> {
+    async saveRecursively(
+        onChunk: (chunk: Chunk, key?: Uint8Array) => Promise<void>
+    ): Promise<{ ref: Uint8Array; rootChunk: Chunk; encryptionKey?: Uint8Array }> {
         for (const fork of this.forks.values()) {
             await fork.node.saveRecursively(onChunk)
         }
-        let nodeEncryptedRef: { address: Uint8Array; key: Uint8Array } | undefined
-        const nodeOnChunk = this.encrypt
-            ? async (chunk: Chunk, key?: Uint8Array) => {
-                  if (key) nodeEncryptedRef = chunk.encryptedHash(key)
-                  await onChunk(chunk, key)
-              }
-            : onChunk
-        const splitter = new ChunkSplitter(nodeOnChunk, this.encrypt)
-        await splitter.append(await this.marshal())
-        const root = await splitter.finalize()
-        if (this.encrypt) {
-            if (!nodeEncryptedRef) {
-                throw new Error('Encrypted ChunkSplitter did not provide an encryption key for manifest node')
+        return this.saveNode(onChunk)
+    }
+
+    private async saveNode(
+        onChunk: (chunk: Chunk, key?: Uint8Array) => Promise<void>
+    ): Promise<{ ref: Uint8Array; rootChunk: Chunk; encryptionKey?: Uint8Array }> {
+        const nodeOnBatch = async (batch: ChunkEntry[]): Promise<ChunkEntry[]> => {
+            for (const { chunk, key } of batch) {
+                await onChunk(chunk, key)
             }
-            this.selfAddress = Binary.concatBytes(nodeEncryptedRef.address, nodeEncryptedRef.key)
-        } else {
-            this.selfAddress = root.hash()
+            return []
         }
-        return this.selfAddress
+        const splitter = new ChunkSplitter(nodeOnBatch, undefined, this.encrypt)
+        await splitter.append(await this.marshal())
+        const rootChunk = await splitter.finalize()
+        // 36.1.1: finalize() no longer calls onBatch for the root chunk — upload it explicitly.
+        if (this.encrypt) {
+            const { address, key: rootKey } = rootChunk.encryptedHash()
+            await onChunk(rootChunk, rootKey)
+            this.selfAddress = Binary.concatBytes(address, rootKey)
+            return { ref: this.selfAddress, rootChunk, encryptionKey: rootKey }
+        }
+        await onChunk(rootChunk)
+        this.selfAddress = rootChunk.hash()
+        return { ref: this.selfAddress, rootChunk }
     }
 
     static unmarshalFromData(data: Uint8Array, selfAddress?: Uint8Array): MantarayNode {

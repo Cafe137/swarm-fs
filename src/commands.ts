@@ -2,9 +2,11 @@ import { AsyncQueue, Binary, Chunk, ChunkSplitter, Dates } from 'cafe-utility'
 import { createReadStream, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join, relative, resolve } from 'node:path'
+import { getMaxShards, makeErasureBatch, makeIntermediateChunkHandler } from './erasure.js'
 import { MantarayNode } from './manifest.js'
 import { ChunkRef, EntryKind, FileRegistry } from './registry.js'
 import { SlotMap } from './slotmap.js'
+import { makeEncryptedReplicas, makeReplicas } from './soc.js'
 import { stamp } from './stamper.js'
 
 const ENCODER = new TextEncoder()
@@ -19,6 +21,7 @@ export interface UploadOpts {
     path: string
     stateDir: string
     encrypt?: boolean
+    redundancyLevel?: number
     fetchFn?: FetchFn
     onProgress?: (file: string, chunksProcessed: number) => void
 }
@@ -26,6 +29,7 @@ export interface UploadOpts {
 export interface BenchSplitOpts {
     path: string
     encrypt?: boolean
+    redundancyLevel?: number
     onProgress?: (file: string, chunksProcessed: number) => void
 }
 
@@ -35,6 +39,7 @@ export interface BenchSignOpts {
     batchDepth: number
     path: string
     encrypt?: boolean
+    redundancyLevel?: number
     onProgress?: (file: string, chunksProcessed: number) => void
 }
 
@@ -109,11 +114,48 @@ function makeOnChunk(
     }
 }
 
+// Like makeOnChunk but for pre-built SOC replicas where address and body are already known.
+// Shares the same slot allocator, upload queue, and error collector as regular chunks.
+function makeRawOnChunk(
+    signer: bigint,
+    batchId: Uint8Array,
+    uploadUrl: string,
+    fetchFn: FetchFn,
+    slotMap: SlotMap,
+    chunks: ChunkRef[],
+    queue: AsyncQueue,
+    uploadErrors: Error[]
+): (address: Uint8Array, data: Uint8Array) => Promise<void> {
+    return async (address: Uint8Array, data: Uint8Array) => {
+        const bucket = Binary.uint16ToNumber(address, 'BE')
+        const slot = slotMap.allocSlot(bucket)
+        chunks.push({ bucket, slot })
+        const swarmPostageStamp = stamp(signer, batchId, address, slot)
+        await queue.enqueue(async () => {
+            try {
+                const response = await fetchFn(uploadUrl, {
+                    method: 'POST',
+                    body: Buffer.from(data),
+                    headers: { 'swarm-postage-stamp': swarmPostageStamp },
+                    signal: AbortSignal.timeout(Dates.seconds(30))
+                })
+                if (!response.ok) {
+                    uploadErrors.push(new Error(`Failed to upload chunk: ${response.status} ${response.statusText}`))
+                }
+            } catch (err) {
+                uploadErrors.push(err instanceof Error ? err : new Error(String(err)))
+            }
+        })
+    }
+}
+
 async function processPath(
     resolvedPath: string,
     encrypt: boolean,
     onChunk: (chunk: Chunk, key?: Uint8Array) => Promise<void>,
-    setFile: (file: string) => void
+    setFile: (file: string) => void,
+    redundancyLevel = 0,
+    onReplica?: (address: Uint8Array, data: Uint8Array) => Promise<void>
 ): Promise<{ manifestRoot: Uint8Array; isDirectory: boolean }> {
     if (statSync(resolvedPath).isDirectory()) {
         // Pass 1: split all file content and collect hashes (32 or 64 bytes depending on encryption)
@@ -121,7 +163,16 @@ async function processPath(
         for (const filePath of walkDir(resolvedPath)) {
             const swarmPath = relative(resolvedPath, filePath)
             setFile(swarmPath)
-            fileHashes.set(swarmPath, await splitFile(filePath, onChunk, encrypt))
+            const { ref, rootChunk, encryptionKey } = await splitFile(filePath, onChunk, encrypt, redundancyLevel)
+            fileHashes.set(swarmPath, ref)
+            if (onReplica) {
+                const replicas = encryptionKey
+                    ? makeEncryptedReplicas(rootChunk, encryptionKey, redundancyLevel)
+                    : makeReplicas(rootChunk, redundancyLevel)
+                for (const replica of replicas) {
+                    await onReplica(replica.address, replica.data)
+                }
+            }
         }
 
         // Pass 2: build the trie.
@@ -140,10 +191,35 @@ async function processPath(
         }
 
         setFile('(manifest)')
-        return { manifestRoot: await root.saveRecursively(onChunk), isDirectory: true }
+        const {
+            ref: manifestRoot,
+            rootChunk: manifestRootChunk,
+            encryptionKey: manifestKey
+        } = await root.saveRecursively(onChunk)
+        if (onReplica) {
+            const replicas = manifestKey
+                ? makeEncryptedReplicas(manifestRootChunk, manifestKey, redundancyLevel)
+                : makeReplicas(manifestRootChunk, redundancyLevel)
+            for (const replica of replicas) {
+                await onReplica(replica.address, replica.data)
+            }
+        }
+        return { manifestRoot, isDirectory: true }
     } else {
         setFile(basename(resolvedPath))
-        const fileRef = await splitFile(resolvedPath, onChunk, encrypt)
+        const {
+            ref: fileRef,
+            rootChunk,
+            encryptionKey
+        } = await splitFile(resolvedPath, onChunk, encrypt, redundancyLevel)
+        if (onReplica) {
+            const replicas = encryptionKey
+                ? makeEncryptedReplicas(rootChunk, encryptionKey, redundancyLevel)
+                : makeReplicas(rootChunk, redundancyLevel)
+            for (const replica of replicas) {
+                await onReplica(replica.address, replica.data)
+            }
+        }
 
         // Wrap in a manifest so the file is browseable via the Bzz gateway
         const filename = basename(resolvedPath)
@@ -151,7 +227,20 @@ async function processPath(
         setFile('(manifest)')
         root.addFork(ENCODER.encode('/'), new Uint8Array(encrypt ? 64 : 32), { 'website-index-document': filename })
         root.addFork(ENCODER.encode(filename), fileRef, { 'Content-Type': guessMimeType(resolvedPath) })
-        return { manifestRoot: await root.saveRecursively(onChunk), isDirectory: false }
+        const {
+            ref: manifestRoot,
+            rootChunk: manifestRootChunk,
+            encryptionKey: manifestKey
+        } = await root.saveRecursively(onChunk)
+        if (onReplica) {
+            const replicas = manifestKey
+                ? makeEncryptedReplicas(manifestRootChunk, manifestKey, redundancyLevel)
+                : makeReplicas(manifestRootChunk, redundancyLevel)
+            for (const replica of replicas) {
+                await onReplica(replica.address, replica.data)
+            }
+        }
+        return { manifestRoot, isDirectory: false }
     }
 }
 
@@ -169,8 +258,10 @@ export async function upload(opts: UploadOpts): Promise<Uint8Array> {
     const uploadErrors: Error[] = []
     const queue = new AsyncQueue(32, 128)
     const rawOnChunk = makeOnChunk(signer, batchId, uploadUrl, fetchFn, slotMap, chunks, queue, uploadErrors)
+    const rawOnReplica = makeRawOnChunk(signer, batchId, uploadUrl, fetchFn, slotMap, chunks, queue, uploadErrors)
 
     const encrypt = opts.encrypt ?? false
+    const redundancyLevel = opts.redundancyLevel ?? 0
 
     let chunksProcessed = 0
     let currentFile = ''
@@ -183,11 +274,18 @@ export async function upload(opts: UploadOpts): Promise<Uint8Array> {
         opts.onProgress?.(currentFile, ++chunksProcessed)
     }
 
-    const { manifestRoot, isDirectory } = await processPath(resolvedPath, encrypt, onChunk, setFile)
+    const { manifestRoot, isDirectory } = await processPath(
+        resolvedPath,
+        encrypt,
+        onChunk,
+        setFile,
+        redundancyLevel,
+        rawOnReplica
+    )
     await queue.drain()
     if (uploadErrors.length > 0) throw uploadErrors[0]
     slotMap.save()
-    registry.add(resolvedPath, manifestRoot, chunks, isDirectory ? 'manifest' : undefined)
+    registry.add(resolvedPath, manifestRoot, chunks, isDirectory ? 'manifest' : undefined, redundancyLevel)
 
     return manifestRoot
 }
@@ -195,6 +293,7 @@ export async function upload(opts: UploadOpts): Promise<Uint8Array> {
 export async function benchSplit(opts: BenchSplitOpts): Promise<void> {
     const resolvedPath = resolve(opts.path)
     const encrypt = opts.encrypt ?? false
+    const redundancyLevel = opts.redundancyLevel ?? 0
 
     let chunksProcessed = 0
     let currentFile = ''
@@ -206,13 +305,14 @@ export async function benchSplit(opts: BenchSplitOpts): Promise<void> {
         opts.onProgress?.(currentFile, ++chunksProcessed)
     }
 
-    await processPath(resolvedPath, encrypt, onChunk, setFile)
+    await processPath(resolvedPath, encrypt, onChunk, setFile, redundancyLevel)
 }
 
 export async function benchSign(opts: BenchSignOpts): Promise<void> {
     const { signer, batchId, batchDepth } = opts
     const resolvedPath = resolve(opts.path)
     const encrypt = opts.encrypt ?? false
+    const redundancyLevel = opts.redundancyLevel ?? 0
 
     const tmpFree = join(tmpdir(), `swarmfs-bench-${process.pid}.free`)
     const slotMap = new SlotMap(tmpFree, batchDepth)
@@ -232,7 +332,7 @@ export async function benchSign(opts: BenchSignOpts): Promise<void> {
     }
 
     try {
-        await processPath(resolvedPath, encrypt, onChunk, setFile)
+        await processPath(resolvedPath, encrypt, onChunk, setFile, redundancyLevel)
     } finally {
         try {
             unlinkSync(tmpFree)
@@ -243,28 +343,32 @@ export async function benchSign(opts: BenchSignOpts): Promise<void> {
 export async function splitFile(
     filePath: string,
     onChunk: (chunk: Chunk, key?: Uint8Array) => Promise<void>,
-    encrypt: boolean
-): Promise<Uint8Array> {
-    let encryptedRef: { address: Uint8Array; key: Uint8Array } | undefined
-    const splitterOnChunk = encrypt
-        ? async (chunk: Chunk, key?: Uint8Array) => {
-              if (key) encryptedRef = chunk.encryptedHash(key)
-              await onChunk(chunk, key)
-          }
-        : onChunk
-    const splitter = new ChunkSplitter(splitterOnChunk, encrypt)
+    encrypt: boolean,
+    redundancyLevel = 0
+): Promise<{ ref: Uint8Array; rootChunk: Chunk; encryptionKey?: Uint8Array }> {
+    const trackingOnChunk = async (chunk: Chunk, key?: Uint8Array) => {
+        await onChunk(chunk, key)
+    }
+    const onBatch = makeErasureBatch(redundancyLevel, encrypt, trackingOnChunk)
+    const splitter = new ChunkSplitter(
+        onBatch,
+        getMaxShards(redundancyLevel, encrypt),
+        encrypt,
+        makeIntermediateChunkHandler(redundancyLevel)
+    )
     const readStream = createReadStream(filePath)
     for await (const bytes of readStream) {
         await splitter.append(bytes)
     }
-    const root = await splitter.finalize()
+    const rootChunk = await splitter.finalize()
+    // 36.1.1: finalize() no longer calls onBatch for the root chunk — upload it explicitly.
     if (encrypt) {
-        if (!encryptedRef) {
-            throw new Error('Encrypted ChunkSplitter did not provide an encryption key')
-        }
-        return Binary.concatBytes(encryptedRef.address, encryptedRef.key)
+        const { address, key: rootKey } = rootChunk.encryptedHash()
+        await trackingOnChunk(rootChunk, rootKey)
+        return { ref: Binary.concatBytes(address, rootKey), rootChunk, encryptionKey: rootKey }
     }
-    return root.hash()
+    await trackingOnChunk(rootChunk)
+    return { ref: rootChunk.hash(), rootChunk }
 }
 
 export async function deleteFile(opts: DeleteOpts): Promise<void> {
@@ -286,7 +390,7 @@ export async function deleteFile(opts: DeleteOpts): Promise<void> {
 
 export function list(
     opts: ListOpts
-): Array<{ path: string; rootHash: Uint8Array; kind: EntryKind; chunkCount: number }> {
+): Array<{ path: string; rootHash: Uint8Array; kind: EntryKind; chunkCount: number; redundancyLevel: number }> {
     const { idx } = getPaths(opts.stateDir, opts.batchId)
     return new FileRegistry(idx).list()
 }

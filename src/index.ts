@@ -33,8 +33,9 @@ async function main() {
         )
     } else if (command === 'list') {
         const batchId = Binary.hexToUint8Array(Types.asHexString(env.SWARMFS_BATCH_ID))
-        for (const { path, rootHash, kind, chunkCount } of list({ batchId, stateDir })) {
-            console.log(`${Binary.uint8ArrayToHex(rootHash)}  ${path}  [${kind}]  ${chunkCount} chunks`)
+        for (const { path, rootHash, kind, chunkCount, redundancyLevel } of list({ batchId, stateDir })) {
+            const redundancy = redundancyLevel > 0 ? `  redundancy=${redundancyLevel}` : ''
+            console.log(`${Binary.uint8ArrayToHex(rootHash)}  ${path}  [${kind}]  ${chunkCount} chunks${redundancy}`)
         }
     } else if (command === 'upload') {
         const signer = Binary.uint256ToNumber(Binary.hexToUint8Array(Types.asHexString(env.SWARMFS_SIGNER)), 'BE')
@@ -43,7 +44,9 @@ async function main() {
         const batchDepth = Types.asNumber(env.SWARMFS_BATCH_DEPTH)
         const uploadArgs = argv.slice(3)
         const encrypt = uploadArgs.includes('--encrypt')
-        const path = resolve(Types.asString(uploadArgs.find(a => !a.startsWith('--'))))
+        const redundancyLevel =
+            parseIntFlag(uploadArgs, '--redundancy') ?? parseInt(env.SWARMFS_REDUNDANCY_LEVEL ?? '0')
+        const path = resolve(Types.asString(findPath(uploadArgs, '--redundancy')))
         let lastFile = ''
         const rootHash = await upload({
             signer,
@@ -53,6 +56,7 @@ async function main() {
             path,
             stateDir,
             encrypt,
+            redundancyLevel,
             onProgress: (file, chunks) => {
                 if (file !== lastFile) {
                     if (lastFile) process.stderr.write('\n')
@@ -71,11 +75,13 @@ async function main() {
     } else if (command === 'bench:split') {
         const benchArgs = argv.slice(3)
         const encrypt = benchArgs.includes('--encrypt')
-        const path = resolve(Types.asString(benchArgs.find(a => !a.startsWith('--'))))
+        const redundancyLevel = parseIntFlag(benchArgs, '--redundancy') ?? parseInt(env.SWARMFS_REDUNDANCY_LEVEL ?? '0')
+        const path = resolve(Types.asString(findPath(benchArgs, '--redundancy')))
         let lastFile = ''
         await benchSplit({
             path,
             encrypt,
+            redundancyLevel,
             onProgress: (file, chunks) => {
                 if (file !== lastFile) {
                     if (lastFile) process.stderr.write('\n')
@@ -91,7 +97,8 @@ async function main() {
         const batchDepth = Types.asNumber(env.SWARMFS_BATCH_DEPTH)
         const benchArgs = argv.slice(3)
         const encrypt = benchArgs.includes('--encrypt')
-        const path = resolve(Types.asString(benchArgs.find(a => !a.startsWith('--'))))
+        const redundancyLevel = parseIntFlag(benchArgs, '--redundancy') ?? parseInt(env.SWARMFS_REDUNDANCY_LEVEL ?? '0')
+        const path = resolve(Types.asString(findPath(benchArgs, '--redundancy')))
         let lastFile = ''
         await benchSign({
             signer,
@@ -99,6 +106,7 @@ async function main() {
             batchDepth,
             path,
             encrypt,
+            redundancyLevel,
             onProgress: (file, chunks) => {
                 if (file !== lastFile) {
                     if (lastFile) process.stderr.write('\n')
@@ -111,4 +119,21 @@ async function main() {
     } else {
         throw new Error(`Unknown command: ${command}. Use status, list, upload, delete, bench:split, or bench:sign.`)
     }
+}
+
+function parseIntFlag(args: string[], flag: string): number | undefined {
+    const eqForm = args.find(a => a.startsWith(`${flag}=`))
+    if (eqForm) return parseInt(eqForm.slice(flag.length + 1))
+    const idx = args.indexOf(flag)
+    if (idx >= 0 && idx + 1 < args.length) return parseInt(args[idx + 1])
+    return undefined
+}
+
+function findPath(args: string[], ...intFlags: string[]): string | undefined {
+    const skipNext = new Set<number>()
+    for (const flag of intFlags) {
+        const idx = args.indexOf(flag)
+        if (idx >= 0) skipNext.add(idx + 1)
+    }
+    return args.find((a, i) => !a.startsWith('--') && !skipNext.has(i))
 }

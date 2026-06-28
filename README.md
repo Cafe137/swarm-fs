@@ -17,6 +17,7 @@ export SWARMFS_UPLOAD_URL="http://localhost:1633/chunks"
 export SWARMFS_SIGNER="<private key hex>"
 export SWARMFS_BATCH_ID="<batch id hex>"
 export SWARMFS_BATCH_DEPTH=<depth of your batch>
+export SWARMFS_REDUNDANCY_LEVEL=0  # 0=none, 1=MEDIUM, 2=STRONG, 3=INSANE, 4=PARANOID
 ```
 
 ```sh
@@ -25,6 +26,12 @@ swarm-fs upload <file|dir>
 
 # Upload with client-side encryption
 swarm-fs upload <file|dir> --encrypt
+
+# Upload with erasure coding for redundancy (levels 1–4: MEDIUM, STRONG, INSANE, PARANOID)
+swarm-fs upload <file|dir> --redundancy=1
+
+# Upload with both encryption and erasure coding
+swarm-fs upload <file|dir> --encrypt --redundancy=2
 
 # List all tracked files and manifests
 swarm-fs list
@@ -68,11 +75,12 @@ A SQLite database tracking all uploaded files, their root chunk hash, and the sl
 
 ```sql
 CREATE TABLE files (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    path      TEXT NOT NULL,
-    root_hash BLOB NOT NULL,   -- 32 bytes
-    chunks    BLOB NOT NULL,   -- repeated [bucket uint16, slot uint16] pairs
-    kind      TEXT NOT NULL DEFAULT 'file'  -- 'file' or 'manifest'
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    path             TEXT NOT NULL,
+    root_hash        BLOB NOT NULL,    -- 32 bytes
+    chunks           BLOB NOT NULL,    -- repeated [bucket uint16, slot uint16] pairs
+    kind             TEXT NOT NULL DEFAULT 'file',  -- 'file' or 'manifest'
+    redundancy_level INTEGER NOT NULL DEFAULT 0     -- 0=none, 1=MEDIUM, 2=STRONG, 3=INSANE, 4=PARANOID
 );
 CREATE INDEX idx_root_hash ON files(root_hash);
 ```

@@ -14,42 +14,53 @@ export class FileRegistry {
         this.db = new Database(path)
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS files (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                path      TEXT NOT NULL,
-                root_hash BLOB NOT NULL,
-                chunks    BLOB NOT NULL,
-                kind      TEXT NOT NULL DEFAULT 'file'
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                path             TEXT NOT NULL,
+                root_hash        BLOB NOT NULL,
+                chunks           BLOB NOT NULL,
+                kind             TEXT NOT NULL DEFAULT 'file',
+                redundancy_level INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_root_hash ON files(root_hash);
         `)
-        // migrate databases created before the kind column was added
         const cols = this.db.prepare('PRAGMA table_info(files)').all() as Array<{ name: string }>
         if (!cols.some(c => c.name === 'kind')) {
             this.db.exec("ALTER TABLE files ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'")
         }
+        if (!cols.some(c => c.name === 'redundancy_level')) {
+            this.db.exec('ALTER TABLE files ADD COLUMN redundancy_level INTEGER NOT NULL DEFAULT 0')
+        }
     }
 
-    list(): Array<{ path: string; rootHash: Uint8Array; kind: EntryKind; chunkCount: number }> {
+    list(): Array<{
+        path: string
+        rootHash: Uint8Array
+        kind: EntryKind
+        chunkCount: number
+        redundancyLevel: number
+    }> {
         const rows = this.db
-            .prepare('SELECT path, root_hash, kind, length(chunks) AS chunks_len FROM files')
+            .prepare('SELECT path, root_hash, kind, length(chunks) AS chunks_len, redundancy_level FROM files')
             .all() as Array<{
             path: string
             root_hash: Buffer
             kind: EntryKind
             chunks_len: number
+            redundancy_level: number
         }>
         return rows.map(row => ({
             path: row.path,
             rootHash: row.root_hash,
             kind: row.kind,
-            chunkCount: row.chunks_len / 4
+            chunkCount: row.chunks_len / 4,
+            redundancyLevel: row.redundancy_level
         }))
     }
 
-    add(path: string, rootHash: Uint8Array, chunks: ChunkRef[], kind: EntryKind = 'file'): void {
+    add(path: string, rootHash: Uint8Array, chunks: ChunkRef[], kind: EntryKind = 'file', redundancyLevel = 0): void {
         this.db
-            .prepare('INSERT INTO files (path, root_hash, chunks, kind) VALUES (?, ?, ?, ?)')
-            .run(path, rootHash, serializeChunks(chunks), kind)
+            .prepare('INSERT INTO files (path, root_hash, chunks, kind, redundancy_level) VALUES (?, ?, ?, ?, ?)')
+            .run(path, rootHash, serializeChunks(chunks), kind, redundancyLevel)
     }
 
     removeByRootHash(rootHash: Uint8Array): ChunkRef[] | null {
